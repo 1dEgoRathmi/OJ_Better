@@ -7,6 +7,7 @@
 2. 读取指定网页的源代码
 3. 从HTML的<main>标签中提取题目信息
 4. 将获取到的题目信息过滤、提取、拼接为纯文本形式，保存到.txt文件
+5. 提取我的竞赛&作业列表，访问进行中作业，抓取未完成的题目信息
 """
 
 import re
@@ -25,11 +26,11 @@ class ProblemExtractor(HTMLParser):
     def __init__(self):
         super().__init__()
         self.text_parts = []
-        self.skip_tags = {"script", "style", "button", "a", "footer", "nav"}
+        self.skip_tags = {'script', 'style', 'button', 'a', 'footer', 'nav'}
         self.skip_count = 0
         self.cookie_jar = http.cookiejar.CookieJar()
         self.opener = None
-        self.base_url = "https://oj.ytu.edu.cn"
+        self.base_url = 'https://oj.ytu.edu.cn'
         self.ocr = ddddocr.DdddOcr(show_ad=False)  # 初始化ddddocr
         self._build_opener()
 
@@ -38,16 +39,10 @@ class ProblemExtractor(HTMLParser):
         cookie_processor = urllib.request.HTTPCookieProcessor(self.cookie_jar)
         self.opener = urllib.request.build_opener(cookie_processor)
         self.opener.addheaders = [
-            (
-                "User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            ),
-            (
-                "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            ),
-            ("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8"),
-            ("Connection", "keep-alive"),
+            ('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'),
+            ('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'),
+            ('Accept-Language', 'zh-CN,zh;q=0.9,en;q=0.8'),
+            ('Connection', 'keep-alive'),
         ]
 
     def handle_starttag(self, tag, attrs):
@@ -77,7 +72,7 @@ class ProblemExtractor(HTMLParser):
         Returns:
             str: 识别出的验证码文本
         """
-        captcha_url = f"{self.base_url}/vcode.php"
+        captcha_url = f'{self.base_url}/vcode.php'
         print(f"正在获取验证码: {captcha_url}")
 
         try:
@@ -90,7 +85,7 @@ class ProblemExtractor(HTMLParser):
             captcha_text = self.ocr.classification(image_data)
 
             # 清理识别结果（去除空格和换行）
-            captcha_text = captcha_text.strip().replace(" ", "").replace("\n", "")
+            captcha_text = captcha_text.strip().replace(' ', '').replace('\n', '')
 
             print(f"验证码识别结果: {captcha_text}")
             return captcha_text
@@ -100,9 +95,63 @@ class ProblemExtractor(HTMLParser):
             # 如果OCR失败，让用户手动输入
             return input("请手动输入验证码: ").strip()
 
+    def _try_login(self, login_url, username, password, vcode):
+        """
+        尝试登录一次
+
+        Args:
+            login_url: 登录页面URL
+            username: 用户名
+            password: 密码
+            vcode: 验证码
+
+        Returns:
+            tuple: (是否成功, 是否需要重试, 响应数据)
+        """
+        # 构建登录表单数据
+        login_data = {
+            "user_id": username,
+            "password": password,
+            "vcode": vcode,
+            "rememberMe": "true",
+            "nojs": "",
+            "submit": "",
+        }
+
+        form_action = f"{self.base_url}/login.php"
+
+        # 编码表单数据
+        encoded_data = urllib.parse.urlencode(login_data).encode("utf-8")
+
+        # 创建登录请求
+        login_request = urllib.request.Request(
+            form_action,
+            data=encoded_data,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": login_url,
+            },
+            method="POST",
+        )
+
+        # 发送登录请求
+        response = self.opener.open(login_request, timeout=30)
+        response_data = response.read().decode("utf-8", errors="ignore")
+
+        # 检查登录成功标志
+        if 'userinfo.php?user=' in response_data or 'logout.php' in response_data:
+            return True, False, response_data
+
+        # 检查验证码错误
+        if '验证码' in response_data and ('错误' in response_data or '不正确' in response_data):
+            return False, True, response_data  # 需要重试
+
+        # 其他错误（密码错误、账号不存在等）
+        return False, False, response_data
+
     def authenticate(self, login_url):
         """
-        进行认证登录，获取cookie
+        进行认证登录，获取cookie（支持验证码错误重试）
 
         Args:
             login_url: 登录页面URL
@@ -111,7 +160,7 @@ class ProblemExtractor(HTMLParser):
             bool: 认证是否成功
         """
         print("\n" + "=" * 50)
-        print("需要进行认证登录")
+        print("【页面1/4】登录页面 - 需要进行认证登录")
         print("=" * 50)
 
         # 获取用户输入
@@ -123,143 +172,72 @@ class ProblemExtractor(HTMLParser):
             return False
 
         try:
-            # 首先访问登录页面获取必要的表单信息
+            # 首先访问登录页面
             print(f"\n正在访问登录页面: {login_url}")
             response = self.opener.open(login_url, timeout=30)
             login_page_html = response.read().decode("utf-8", errors="ignore")
             print("已获取登录页面")
 
-            # 获取验证码
-            vcode = self._get_captcha()
-            if not vcode:
-                print("验证码不能为空")
-                return False
+            # 验证码错误重试机制（最多10次）
+            max_retries = 10
+            for attempt in range(1, max_retries + 1):
+                print(f"\n--- 第 {attempt} 次登录尝试 ---")
 
-            # 构建登录表单数据（根据登录页源代码）
-            login_data = {
-                "user_id": username,
-                "password": password,
-                "vcode": vcode,
-                "rememberMe": "on",
-                "nojs": "",
-                "submit": "",
-            }
+                # 获取验证码
+                vcode = self._get_captcha()
+                if not vcode:
+                    print("验证码不能为空")
+                    continue
 
-            # 登录提交URL（根据登录页源代码中的form action）
-            form_action = f"{self.base_url}/login.php"
+                # 尝试登录
+                try:
+                    success, need_retry, response_data = self._try_login(
+                        login_url, username, password, vcode
+                    )
 
-            print(f"正在提交登录请求到: {form_action}")
+                    if success:
+                        print("登录成功！")
+                        self._print_cookies()
+                        return True
 
-            # 编码表单数据
-            encoded_data = urllib.parse.urlencode(login_data).encode("utf-8")
+                    if need_retry and attempt < max_retries:
+                        print("验证码错误，准备重试...")
+                        continue
+                    else:
+                        # 其他错误或已达到最大重试次数
+                        print("检查账号密码信息、平台考试状态或网络问题")
+                        return False
 
-            # 创建登录请求
-            login_request = urllib.request.Request(
-                form_action,
-                data=encoded_data,
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Referer": login_url,
-                },
-                method="POST",
-            )
-
-            # 发送登录请求
-            response = self.opener.open(login_request, timeout=30)
-            response_data = response.read().decode("utf-8", errors="ignore")
-
-            # 根据登录页源代码，返回的是JSON格式
-            try:
-                result = json.loads(response_data)
-                if result.get("success") == 1:
-                    print("登录成功！")
-                    self._print_cookies()
-                    return True
-                elif result.get("success") == 0:
-                    print(f"登录失败: {result.get('error', '未知错误')}")
+                except urllib.error.URLError as e:
+                    print("检查账号密码信息、平台考试状态或网络问题")
                     return False
-                elif result.get("success") == 2:
-                    print(f"登录警告: {result.get('warning', '有警告但继续')}")
-                    print("登录成功！")
-                    self._print_cookies()
-                    return True
-                else:
-                    # 如果不是JSON格式，按原来的方式检查
-                    return self._check_login_success(response_data)
-            except json.JSONDecodeError:
-                # 返回的不是JSON，按HTML处理
-                if self._check_login_success(response_data):
-                    print("登录成功！")
-                    self._print_cookies()
-                    return True
-                else:
-                    print("登录失败")
+                except Exception as e:
+                    print("检查账号密码信息、平台考试状态或网络问题")
                     return False
+
+            # 达到最大重试次数
+            print("验证码错误次数过多，请稍后重试")
+            return False
 
         except urllib.error.URLError as e:
-            print(f"网络错误: {e}")
+            print("检查账号密码信息、平台考试状态或网络问题")
             return False
         except Exception as e:
-            print(f"认证时出错: {e}")
+            print("检查账号密码信息、平台考试状态或网络问题")
             return False
-
-    def _check_login_success(self, html):
-        """
-        检查登录是否成功（备用方法）
-
-        Args:
-            html: 登录后的页面HTML
-
-        Returns:
-            bool: 是否登录成功
-        """
-        # 检查常见的登录失败标志
-        error_patterns = [
-            r"密码错误",
-            r"账号不存在",
-            r"login failed",
-            r"invalid password",
-            r"用户名或密码错误",
-            r"验证码错误",
-            r"验证码",
-        ]
-
-        for pattern in error_patterns:
-            if re.search(pattern, html, re.IGNORECASE):
-                return False
-
-        # 检查登录成功标志
-        success_patterns = [
-            r"logout\.php",
-            r"注销",
-            r"退出登录",
-            r"欢迎",
-            r"userinfo\.php",
-        ]
-
-        for pattern in success_patterns:
-            if re.search(pattern, html, re.IGNORECASE):
-                return True
-
-        # 默认认为成功（如果页面能正常访问）
-        return True
 
     def _print_cookies(self):
         """打印获取到的cookie信息"""
         print("\n已获取的Cookies:")
         print("-" * 50)
 
-        target_cookies = ["remember", "lastlang", "PHPSESSID", "wengine_new_ticket"]
+        target_cookies = ['remember', 'lastlang', 'PHPSESSID', 'wengine_new_ticket']
         found_cookies = {}
 
         for cookie in self.cookie_jar:
             if cookie.name in target_cookies:
                 found_cookies[cookie.name] = cookie.value
-                print(
-                    f"{cookie.name}: {cookie.value[:30]}..."
-                    if len(cookie.value) > 30
-                    else f"{cookie.name}: {cookie.value}"
-                )
+                print(f"{cookie.name}: {cookie.value[:30]}..." if len(cookie.value) > 30 else f"{cookie.name}: {cookie.value}")
 
         # 显示未获取到的cookie
         for name in target_cookies:
@@ -282,20 +260,49 @@ class ProblemExtractor(HTMLParser):
             request = urllib.request.Request(url)
             response = self.opener.open(request, timeout=30)
 
-            content_type = response.headers.get("Content-Type", "")
-            charset_match = re.search(r"charset=([\w-]+)", content_type)
-            encoding = charset_match.group(1) if charset_match else "utf-8"
+            content_type = response.headers.get('Content-Type', '')
+            charset_match = re.search(r'charset=([\w-]+)', content_type)
+            encoding = charset_match.group(1) if charset_match else 'utf-8'
 
             try:
                 return response.read().decode(encoding)
             except UnicodeDecodeError:
-                return response.read().decode("utf-8", errors="ignore")
+                return response.read().decode('utf-8', errors='ignore')
         except urllib.error.URLError as e:
             print(f"网络错误: {e}")
             return None
         except Exception as e:
             print(f"获取网页时出错: {e}")
             return None
+
+    def extract_active_cids(self, html):
+        """
+        从HTML中提取进行中的作业CID列表
+
+        Args:
+            html: 网页HTML源代码
+
+        Returns:
+            list: 进行中作业的CID列表
+        """
+        active_cids = []
+
+        # 匹配表格中的每一行
+        row_pattern = r'<tr>\s*<td>(\d+)</td>\s*<td><a[^>]*href="contest\.php\?cid=(\d+)"[^>]*>([^<]+)</a></td>\s*<td>(.*?)</td>'
+        matches = re.findall(row_pattern, html, re.DOTALL)
+
+        for match in matches:
+            cid, cid2, name, status_html = match
+            name = name.strip()
+
+            # 只记录进行中的作业
+            if '运行中' in status_html or 'text-danger' in status_html:
+                active_cids.append({
+                    'cid': cid,
+                    'name': name
+                })
+
+        return active_cids
 
     def extract_problem_from_main(self, html):
         """
@@ -307,7 +314,7 @@ class ProblemExtractor(HTMLParser):
         Returns:
             str: 包含题目信息的HTML代码段
         """
-        main_match = re.search(r"<main[^>]*>([\s\S]*?)</main>", html, re.IGNORECASE)
+        main_match = re.search(r'<main[^>]*>([\s\S]*?)</main>', html, re.IGNORECASE)
         return main_match.group(1) if main_match else None
 
     def html_to_text(self, html):
@@ -322,56 +329,63 @@ class ProblemExtractor(HTMLParser):
         """
         self.reset_parser()
         self.feed(html)
-        text = " ".join(self.text_parts)
-        text = re.sub(r"\s+", " ", text).strip()
+        text = ' '.join(self.text_parts)
+        text = re.sub(r'\s+', ' ', text).strip()
         return text
 
-    def extract(self, url):
+    def extract_problem_details(self, url):
         """
-        提取题目信息的主函数
+        提取题目详细信息
 
         Args:
-            url: 网页URL
+            url: 题目页面URL
 
         Returns:
-            dict: 包含提取结果的字典
+            str: 题目文本内容
         """
-        result = {"url": url, "problem_text": "", "success": False}
-
-        print(f"正在读取网页: {url}")
+        print(f"\n  正在读取题目页面: {url}")
         html = self.fetch_webpage(url)
         if not html:
-            print("无法获取网页内容")
-            return result
-
-        print(f"HTML内容长度: {len(html)} 字符")
-        print("正在提取题目信息...")
+            print("  无法获取题目内容")
+            return None
 
         main_content = self.extract_problem_from_main(html)
         if main_content:
-            print("从<main>标签提取到题目信息")
-            result["problem_text"] = self.html_to_text(main_content)
-            result["success"] = True
+            return self.html_to_text(main_content)
         else:
-            print("未找到<main>标签，无法提取题目信息")
+            print("  未找到题目内容")
+            return None
 
-        return result
-
-    def save_to_file(self, text, filename="problem_info.txt"):
+    def save_problems_to_file(self, all_problems, filename='all_problems.txt'):
         """
-        将文本保存到文件
+        将所有题目信息保存到文件
 
         Args:
-            text: 要保存的文本
+            all_problems: 所有题目的列表
             filename: 文件名
 
         Returns:
             bool: 是否保存成功
         """
         try:
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write(text)
-            print(f"文本已保存到: {filename}")
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write("=" * 60 + "\n")
+                f.write("YTUOJ 题目信息汇总\n")
+                f.write("=" * 60 + "\n\n")
+
+                for i, problem in enumerate(all_problems, 1):
+                    f.write(f"题目 {i}\n")
+                    f.write("-" * 60 + "\n")
+                    f.write(f"来源: {problem.get('contest_name', '未知')}\n")
+                    f.write(f"CID: {problem.get('cid', '未知')}, PID: {problem.get('pid', '未知')}\n")
+                    f.write(f"题目名称: {problem.get('name', '未知')}\n")
+                    f.write("\n")
+                    f.write(problem.get('content', '无内容'))
+                    f.write("\n\n")
+                    f.write("=" * 60 + "\n\n")
+
+            print(f"\n所有题目信息已保存到: {filename}")
+            print(f"共保存 {len(all_problems)} 道题目")
             return True
         except Exception as e:
             print(f"保存文件时出错: {e}")
@@ -382,41 +396,130 @@ def main():
     """主函数"""
     extractor = ProblemExtractor()
 
-    # 目标题目URL
-    target_url = "https://oj.ytu.edu.cn/problem.php?cid=5614&pid=7"
-    login_url = "https://oj.ytu.edu.cn/loginpage.php"
+    # URL配置
+    my_contests_url = 'https://oj.ytu.edu.cn/contest.php?my'
+    login_url = 'https://oj.ytu.edu.cn/loginpage.php'
 
-    print("=" * 50)
+    print("=" * 60)
     print("YTUOJ 题目信息提取器")
-    print("=" * 50)
+    print("=" * 60)
 
-    # 访问逻辑：登录页 -> 题目页
-    # 先进行登录认证
-    print("\n访问流程：登录页 -> 题目页")
+    # ========== 页面1: 登录页面 ==========
+    print("\n程序流程: 登录页面 -> 主页面 -> 作业页面 -> 题目页面")
     if not extractor.authenticate(login_url):
         print("认证失败，程序退出")
         return
 
-    # 登录成功后，访问目标页面获取题目
-    print(f"\n正在获取题目信息: {target_url}")
-    result = extractor.extract(target_url)
+    # ========== 页面2: 主页面（我的竞赛&作业列表） ==========
+    print("\n" + "=" * 60)
+    print("【页面2/4】主页面 - 我的竞赛&作业列表")
+    print("=" * 60)
+    print(f"\n正在访问: {my_contests_url}")
+    html = extractor.fetch_webpage(my_contests_url)
 
-    if result["success"]:
-        print("\n" + "=" * 50)
-        print("提取的题目信息:")
-        print("=" * 50)
-        preview = result["problem_text"][:500]
-        print(preview + "..." if len(result["problem_text"]) > 500 else preview)
+    if not html:
+        print("无法获取主页面内容")
+        return
 
-        default_filename = "problem_info.txt"
-        filename = input(f"\n请输入保存文件名（默认: {default_filename}）: ").strip()
-        if not filename:
-            filename = default_filename
+    print(f"页面获取成功，长度: {len(html)} 字符")
 
-        extractor.save_to_file(result["problem_text"], filename)
-    else:
-        print("未能提取到题目信息")
+    # 提取进行中作业的CID
+    active_contests = extractor.extract_active_cids(html)
+
+    if not active_contests:
+        print("\n没有进行中的作业")
+        return
+
+    print(f"\n找到 {len(active_contests)} 个进行中的作业:")
+    for i, contest in enumerate(active_contests, 1):
+        print(f"  {i}. CID {contest['cid']}: {contest['name']}")
+
+    # ========== 页面3: 作业页面 ==========
+    print("\n" + "=" * 60)
+    print("【页面3/4】作业页面 - 获取各作业的题目列表")
+    print("=" * 60)
+
+    all_incomplete_problems = []  # 存储所有未完成的题目
+
+    for contest in active_contests:
+        cid = contest['cid']
+        contest_name = contest['name']
+        contest_url = f"https://oj.ytu.edu.cn/contest.php?cid={cid}"
+
+        print(f"\n正在访问作业页面: {contest_url}")
+        contest_html = extractor.fetch_webpage(contest_url)
+
+        if not contest_html:
+            print(f"  无法获取CID {cid} 的作业页面")
+            continue
+
+        # 根据实际作业页面结构提取题目列表
+        # 表格行格式：<tr><td>状态</td><td>题目编号</td><td><a href="problem.php?cid=xxx&pid=x">title</a></td><td>source</td><td>accepted</td><td>submitted</td></tr>
+        # 第一列<td></td>为空表示未完成，有内容表示已完成
+        problem_rows = re.findall(
+            r'<tr>\s*<td>(.*?)</td>\s*<td>([^<]+)</td>\s*<td><a[^>]*href="problem\.php\?cid=' + cid + r'&pid=(\d+)"[^>]*>([^<]+)</a></td>\s*<td[^>]*>([^<]*)</td>\s*<td>([^<]*)</td>\s*<td>([^<]*)</td>\s*</tr>',
+            contest_html
+        )
+
+        print(f"  找到 {len(problem_rows)} 道题目")
+
+        for status_col, problem_id, pid, title, source, accepted, submitted in problem_rows:
+            # 判断完成状态：只有绿色勾表示已完成，其他状态（空、红色叉）都需要抓取
+            is_completed = 'fa-check' in status_col and 'text-success' in status_col
+
+            if is_completed:
+                print(f"    - PID {pid}: {title.strip()} [已完成，跳过]")
+            else:
+                # 判断是错题还是未做
+                if 'fa-times' in status_col or 'text-danger' in status_col:
+                    status_text = "错题，将抓取"
+                else:
+                    status_text = "未完成，将抓取"
+                print(f"    - PID {pid}: {title.strip()} [{status_text}]")
+                all_incomplete_problems.append({
+                    'cid': cid,
+                    'contest_name': contest_name,
+                    'pid': pid,
+                    'problem_id': problem_id.strip(),
+                    'name': title.strip(),
+                    'source': source.strip(),
+                    'accepted': accepted.strip(),
+                    'submitted': submitted.strip(),
+                    'url': f"https://oj.ytu.edu.cn/problem.php?cid={cid}&pid={pid}"
+                })
+
+    if not all_incomplete_problems:
+        print("\n所有题目都已完成，没有需要抓取的题目")
+        return
+
+    print(f"\n共找到 {len(all_incomplete_problems)} 道未完成的题目")
+
+    # ========== 页面4: 题目页面 ==========
+    print("\n" + "=" * 60)
+    print("【页面4/4】题目页面 - 抓取未完成的题目信息")
+    print("=" * 60)
+
+    for i, problem in enumerate(all_incomplete_problems, 1):
+        print(f"\n[{i}/{len(all_incomplete_problems)}] 抓取题目: {problem['name']}")
+        content = extractor.extract_problem_details(problem['url'])
+        problem['content'] = content if content else "无法获取题目内容"
+
+    # 保存所有题目信息
+    print("\n" + "=" * 60)
+    print("保存题目信息")
+    print("=" * 60)
+
+    default_filename = 'all_problems.txt'
+    filename = input(f"\n请输入保存文件名（默认: {default_filename}）: ").strip()
+    if not filename:
+        filename = default_filename
+
+    extractor.save_problems_to_file(all_incomplete_problems, filename)
+
+    print("\n" + "=" * 60)
+    print("程序执行完毕")
+    print("=" * 60)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

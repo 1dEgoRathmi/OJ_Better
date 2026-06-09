@@ -1,3 +1,6 @@
 {
-    "python-envs.defaultEnvManager": "ms-python.python:system"
+    // 1. 当前项目固定用这个解释器（必须写死路径）
+    "python.defaultInterpreterPath": "C:\\Users\\HP\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+    // 2. 终端自动激活环境
+    "python.terminal.activateEnvironment": true
 }
