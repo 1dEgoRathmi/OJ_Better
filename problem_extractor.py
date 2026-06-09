@@ -8,6 +8,7 @@
 3. 从HTML的<main>标签中提取题目信息
 4. 将获取到的题目信息过滤、提取、拼接为纯文本形式，保存到.txt文件
 5. 提取我的竞赛&作业列表，访问进行中作业，抓取未完成的题目信息
+6. 调用DeepSeek API解题并自动提交到OJ
 """
 
 import re
@@ -18,6 +19,12 @@ import http.cookiejar
 import json
 from html.parser import HTMLParser
 import ddddocr
+from openai import OpenAI
+
+
+def waf_encode(code):
+    """OJ提交所需：将源代码编码为十六进制管道格式"""
+    return '|'.join(hex(ord(c))[2:] for c in code)
 
 
 class ProblemExtractor(HTMLParser):
@@ -32,6 +39,7 @@ class ProblemExtractor(HTMLParser):
         self.opener = None
         self.base_url = 'https://oj.ytu.edu.cn'
         self.ocr = ddddocr.DdddOcr(show_ad=False)  # 初始化ddddocr
+        self.deepseek_api_key = ''  # DeepSeek API密钥
         self._build_opener()
 
     def _build_opener(self):
@@ -356,6 +364,116 @@ class ProblemExtractor(HTMLParser):
             print("  未找到题目内容")
             return None
 
+    def solve_with_deepseek(self, problem_text):
+        """
+        调用 DeepSeek API（v4-pro模型）解题
+
+        Args:
+            problem_text: 题目文本
+
+        Returns:
+            str: 解题代码，失败返回 None
+        """
+        print("  正在调用 DeepSeek v4-pro API 解题...")
+
+        prompt = (
+            "你是一个算法竞赛专家。请根据以下OJ题目描述，编写可直接提交的Python代码解答。\n"
+            "要求：\n"
+            "1. 只输出纯代码，不要包含任何解释文字、markdown标记（如```python```）、注释\n"
+            "2. 使用 sys.stdin.read 或 input() 读取输入，使用 print() 输出结果\n"
+            "3. 代码要简洁、正确、高性能\n\n"
+            f"题目描述：\n{problem_text}"
+        )
+
+        try:
+            client = OpenAI(
+                api_key=self.deepseek_api_key,
+                base_url="https://api.deepseek.com"
+            )
+
+            response = client.chat.completions.create(
+                model="deepseek-v4-pro",
+                messages=[
+                    {"role": "system", "content": "你是一个算法竞赛专家，只输出解题代码。"},
+                    {"role": "user", "content": prompt}
+                ],
+                stream=False,
+                reasoning_effort="high",
+                extra_body={"thinking": {"type": "enabled"}}
+            )
+
+            code = response.choices[0].message.content
+
+            # 清理可能的 markdown 标记
+            code = re.sub(r'^```(?:python)?\s*\n?', '', code)
+            code = re.sub(r'\n?```\s*$', '', code)
+            code = code.strip()
+
+            print(f"  解题成功，代码长度: {len(code)} 字符")
+            return code
+        except Exception as e:
+            print(f"  DeepSeek API 调用失败: {e}")
+            return None
+
+    def submit_solution(self, cid, pid, code):
+        """
+        提交代码到 OJ（页面5：提交页面）
+
+        Args:
+            cid: 竞赛ID
+            pid: 题目ID
+            code: Python源代码
+
+        Returns:
+            bool: 是否提交成功
+        """
+        submit_url = f'{self.base_url}/submit.php'
+
+        print(f"  正在提交代码到 OJ: cid={cid}, pid={pid}")
+
+        # waf_encode 编码源代码
+        encoded_source = waf_encode(code)
+
+        # 构建提交表单数据
+        submit_data = {
+            'cid': str(cid),
+            'pid': str(pid),
+            'language': '6',  # 6 = Python
+            'source': encoded_source
+        }
+
+        # 编码表单数据
+        encoded_data = urllib.parse.urlencode(submit_data).encode('utf-8')
+
+        # 创建提交请求（携带登录状态的cookie）
+        submit_request = urllib.request.Request(
+            submit_url,
+            data=encoded_data,
+            headers={
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Referer': f'{self.base_url}/submitpage.php?cid={cid}&pid={pid}'
+            },
+            method='POST'
+        )
+
+        try:
+            response = self.opener.open(submit_request, timeout=30)
+            response_data = response.read().decode('utf-8', errors='ignore')
+
+            # 检查提交结果
+            if 'success' in response_data.lower() or response.status == 200:
+                print("  提交成功！")
+                return True
+            else:
+                print(f"  提交可能失败，服务器返回长度: {len(response_data)}")
+                return True  # 通常200就表示提交成功
+        except urllib.error.URLError as e:
+            print(f"  提交失败: {e}")
+            return False
+        except Exception as e:
+            print(f"  提交时出错: {e}")
+            return False
+
     def save_problems_to_file(self, all_problems, filename='all_problems.txt'):
         """
         将所有题目信息保存到文件
@@ -404,15 +522,23 @@ def main():
     print("YTUOJ 题目信息提取器")
     print("=" * 60)
 
+    # 输入 DeepSeek API Key
+    api_key = input("请输入 DeepSeek API Key（回车跳过自动解题）: ").strip()
+    if api_key:
+        extractor.deepseek_api_key = api_key
+        print("已设置 DeepSeek API Key，将自动解题并提交")
+    else:
+        print("未设置 API Key，将仅提取题目信息")
+
     # ========== 页面1: 登录页面 ==========
-    print("\n程序流程: 登录页面 -> 主页面 -> 作业页面 -> 题目页面")
+    print("\n程序流程: 登录页面 -> 主页面 -> 作业页面 -> 题目页面 -> 提交页面")
     if not extractor.authenticate(login_url):
         print("认证失败，程序退出")
         return
 
     # ========== 页面2: 主页面（我的竞赛&作业列表） ==========
     print("\n" + "=" * 60)
-    print("【页面2/4】主页面 - 我的竞赛&作业列表")
+    print("【页面2/5】主页面 - 我的竞赛&作业列表")
     print("=" * 60)
     print(f"\n正在访问: {my_contests_url}")
     html = extractor.fetch_webpage(my_contests_url)
@@ -436,7 +562,7 @@ def main():
 
     # ========== 页面3: 作业页面 ==========
     print("\n" + "=" * 60)
-    print("【页面3/4】作业页面 - 获取各作业的题目列表")
+    print("【页面3/5】作业页面 - 获取各作业的题目列表")
     print("=" * 60)
 
     all_incomplete_problems = []  # 存储所有未完成的题目
@@ -454,8 +580,6 @@ def main():
             continue
 
         # 根据实际作业页面结构提取题目列表
-        # 表格行格式：<tr><td>状态</td><td>题目编号</td><td><a href="problem.php?cid=xxx&pid=x">title</a></td><td>source</td><td>accepted</td><td>submitted</td></tr>
-        # 第一列<td></td>为空表示未完成，有内容表示已完成
         problem_rows = re.findall(
             r'<tr>\s*<td>(.*?)</td>\s*<td>([^<]+)</td>\s*<td><a[^>]*href="problem\.php\?cid=' + cid + r'&pid=(\d+)"[^>]*>([^<]+)</a></td>\s*<td[^>]*>([^<]*)</td>\s*<td>([^<]*)</td>\s*<td>([^<]*)</td>\s*</tr>',
             contest_html
@@ -496,13 +620,39 @@ def main():
 
     # ========== 页面4: 题目页面 ==========
     print("\n" + "=" * 60)
-    print("【页面4/4】题目页面 - 抓取未完成的题目信息")
+    print("【页面4/5】题目页面 - 抓取未完成的题目信息")
     print("=" * 60)
 
     for i, problem in enumerate(all_incomplete_problems, 1):
         print(f"\n[{i}/{len(all_incomplete_problems)}] 抓取题目: {problem['name']}")
         content = extractor.extract_problem_details(problem['url'])
         problem['content'] = content if content else "无法获取题目内容"
+
+    # ========== 页面5: 提交页面 (DeepSeek解题 + 提交) ==========
+    print("\n" + "=" * 60)
+    print("【页面5/5】自动解题与提交")
+    print("=" * 60)
+
+    if extractor.deepseek_api_key:
+        for i, problem in enumerate(all_incomplete_problems, 1):
+            if not problem.get('content') or problem['content'] == "无法获取题目内容":
+                print(f"\n[{i}/{len(all_incomplete_problems)}] 跳过（无题目内容）: {problem['name']}")
+                continue
+
+            print(f"\n[{i}/{len(all_incomplete_problems)}] 解题: {problem['name']}")
+
+            # 调用 DeepSeek API 解题
+            code = extractor.solve_with_deepseek(problem['content'])
+
+            if code:
+                # 提交代码到 OJ
+                cid = problem['cid']
+                pid = problem['pid']
+                extractor.submit_solution(cid, pid, code)
+            else:
+                print(f"  跳过提交: {problem['name']}（解题失败）")
+    else:
+        print("\n未设置 DeepSeek API Key，跳过自动解题步骤")
 
     # 保存所有题目信息
     print("\n" + "=" * 60)
